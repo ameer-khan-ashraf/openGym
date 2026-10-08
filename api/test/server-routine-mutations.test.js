@@ -83,3 +83,88 @@ test('invalid operations and a lock held by another writer never partially commi
   assert.equal(fs.readFileSync(h.file, 'utf8'), before);
   fs.unlinkSync(h.file + '.lock');
 });
+
+test('two plan creates confirmed at the same revision commit exactly once', async t => {
+  const h = await server(t);
+  fs.writeFileSync(h.file, JSON.stringify(initial()));
+  const create = name => ({ operation: 'create', baseRev: 4, input: {
+    routines: [{ name, exercises: [{ id: '0001', sets: 3, reps: 8 }] }]
+  } });
+  const responses = await Promise.all(['Plan A', 'Plan B'].map(name => h.request('/api/routines/mutate', create(name))));
+  assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
+  const saved = responses.find(r => r.status === 200).body;
+  const refused = responses.find(r => r.status === 409).body;
+  const current = (await h.request('/api/data', undefined, 'one', 'GET')).body;
+  assert.equal(current.rev, 5);
+  assert.equal(current.state.routines.length, 2);
+  assert.equal(current.state.routines[1].id, saved.created_routines[0].id);
+  assert.equal(current.state.routines[1].name, saved.created_routines[0].name);
+  assert.deepEqual(current.state.workouts, initial().workouts);
+  assert.equal(refused.rev, current.rev);
+  assert.deepEqual(refused.state, current.state);
+});
+
+test('phone sync and a routine edit share one compare-and-write boundary', async t => {
+  const h = await server(t);
+  fs.writeFileSync(h.file, JSON.stringify(initial()));
+  assert.equal((await h.request('/api/data/rev', undefined, 'one', 'GET')).body.rev, 4);
+  const phone = { ...initial(), workouts: [...initial().workouts, { id: 'phone-workout', entries: [] }] };
+  const [synced, edited] = await Promise.all([
+    h.request('/api/data', { state: phone, baseRev: 4 }, 'one', 'PUT'),
+    h.request('/api/routines/mutate', { operation: 'edit', baseRev: 4, input: { routine_id: 'old', name: 'MCP edit' } })
+  ]);
+  assert.deepEqual([synced.status, edited.status].sort(), [200, 409]);
+  const current = (await h.request('/api/data', undefined, 'one', 'GET')).body;
+  assert.equal(current.rev, 5);
+  assert.equal((await h.request('/api/data/rev', undefined, 'one', 'GET')).body.rev, current.rev);
+  // Either caller may win. The other gets the complete winning state, never a silent overwrite.
+  assert.equal(current.state.routines[0].name, edited.status === 200 ? 'MCP edit' : 'Existing');
+  assert.deepEqual(current.state.workouts, synced.status === 200 ? phone.workouts : initial().workouts);
+  const conflict = (synced.status === 409 ? synced : edited).body;
+  assert.equal(conflict.rev, current.rev);
+  assert.deepEqual(conflict.state, current.state);
+});
+
+test('one invalid routine refuses the entire plan and leaves the confirmed revision usable', async t => {
+  const h = await server(t);
+  fs.writeFileSync(h.file, JSON.stringify(initial()));
+  const before = fs.readFileSync(h.file, 'utf8');
+  assert.equal((await h.request('/api/data/rev', undefined, 'one', 'GET')).body.rev, 4);
+  const valid = { name: 'Valid', exercises: [{ id: '0001', sets: 3, reps: 8 }] };
+  const response = await h.request('/api/routines/mutate', { operation: 'create', baseRev: 4, input: {
+    routines: [valid, { name: 'Unknown exercise', exercises: [{ id: 'not-in-catalogue', sets: 3, reps: 8 }] }],
+    weekdays: [{ weekday: 1, routine_indexes: [0, 1] }]
+  } });
+  assert.equal(response.status, 400);
+  assert.match(response.body.error, /Unknown exercise/);
+  assert.equal(fs.readFileSync(h.file, 'utf8'), before);
+  assert.equal((await h.request('/api/data/rev', undefined, 'one', 'GET')).body.rev, 4);
+  const retry = await h.request('/api/routines/mutate', { operation: 'create', baseRev: 4, input: { routines: [valid] } });
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.rev, 5);
+  const current = JSON.parse(fs.readFileSync(h.file));
+  assert.deepEqual(current.week, initial().week);
+  assert.deepEqual(current.routines.map(r => r.name), ['Existing', 'Valid']);
+});
+
+test('editing repeated exercise slots preserves their individual settings through the API', async t => {
+  const h = await server(t);
+  const state = initial();
+  state.routines[0].ex = [
+    { id: '0001', sets: 3, reps: 8, weight: 40, restSec: 120, note: 'Heavy', warmup: true },
+    { id: '0001', sets: 2, reps: 12, weight: 20, restSec: 60, note: 'Light' }
+  ];
+  fs.writeFileSync(h.file, JSON.stringify(state));
+  const edited = await h.request('/api/routines/mutate', { operation: 'edit', baseRev: 4, input: {
+    routine_id: 'old', exercises: [{ id: '0001', sets: 4, reps: 6 }, { id: '0001', sets: 2, reps: 15 }]
+  } });
+  assert.equal(edited.status, 200);
+  const current = (await h.request('/api/data', undefined, 'one', 'GET')).body;
+  assert.equal(current.rev, 5);
+  assert.deepEqual(current.state.routines[0].ex, [
+    { ...state.routines[0].ex[0], mode: 'reps', sets: 4, reps: 6 },
+    { ...state.routines[0].ex[1], mode: 'reps', reps: 15 }
+  ]);
+  assert.deepEqual(current.state.workouts, state.workouts);
+  assert.deepEqual(current.state.week, state.week);
+});
